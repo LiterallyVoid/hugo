@@ -174,7 +174,9 @@ func CreateTargetPaths(d TargetPathDescriptor) (tp TargetPaths) {
 		hasDot := strings.Contains(d.URL, ".")
 		hasSlash := strings.HasSuffix(d.URL, slash)
 
-		if hasSlash || !hasDot {
+		if isUgly {
+			pagePath = pagePath+fullSuffix
+		} else if hasSlash || !hasDot {
 			pagePath = pjoin(pagePath, d.Type.BaseName+fullSuffix)
 		} else if hasDot {
 			pagePathDir = path.Dir(pagePathDir)

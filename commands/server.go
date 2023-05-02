@@ -276,31 +276,20 @@ func (f *fileServer) createEndpoint(i int) (*http.ServeMux, net.Listener, string
 				w.Header().Set(header.Key, header.Value)
 			}
 
-			if true {
-				jww.FEEDBACK.Println("checking for .html extension")
+			path := filepath.Clean(strings.TrimPrefix(requestURI, u.Path))
+			if root != "" {
+				path = filepath.Join(root, path)
+			}
 
-				path := filepath.Clean(strings.TrimPrefix(requestURI, u.Path))
-				if root != "" {
-					path = filepath.Join(root, path)
-				}
+			fs := f.c.publishDirServerFs
+			fi, err := fs.Stat(path)
 
-				fs := f.c.publishDirServerFs
-				fi, err := fs.Stat(path)
+			if err != nil || fi.IsDir() {
+				if !strings.HasSuffix(path, "/") && filepath.Ext(path) == "" {
+					if r2 := f.rewriteRequest(r, r.RequestURI + ".html"); r2 != nil {
+						r = r2
 
-				jww.FEEDBACK.Println("path", path)
-
-				if err != nil || fi.IsDir() {
-					jww.FEEDBACK.Println("ERROR!")
-					if !strings.HasSuffix(path, "/") && filepath.Ext(path) == "" {
-						jww.FEEDBACK.Println("rewriting", path, "to", path + ".html")
-						jww.FEEDBACK.Println("old path:", r.RequestURI)
-						if r2 := f.rewriteRequest(r, r.RequestURI + ".html"); r2 != nil {
-							r = r2
-
-							requestURI = r.RequestURI + ".html"
-						}
-
-						jww.FEEDBACK.Println("new path:", r.RequestURI)
+						requestURI = r.RequestURI + ".html"
 					}
 				}
 			}

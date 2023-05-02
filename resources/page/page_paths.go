@@ -69,6 +69,8 @@ type TargetPathDescriptor struct {
 
 	// Some types cannot have uglyURLs, even if globally enabled, RSS being one example.
 	UglyURLs bool
+
+	RemoveHTMLExtension bool
 }
 
 // TODO(bep) move this type.
@@ -180,7 +182,7 @@ func CreateTargetPaths(d TargetPathDescriptor) (tp TargetPaths) {
 
 		if !isHtmlIndex(pagePath) {
 			link = pagePath
-		} else if !hasSlash {
+		} else if !hasSlash && !isUgly {
 			link += slash
 		}
 
@@ -304,6 +306,12 @@ func CreateTargetPaths(d TargetPathDescriptor) (tp TargetPaths) {
 	}
 
 	linkDir = strings.TrimSuffix(path.Join(slash, linkDir), slash)
+
+	if d.RemoveHTMLExtension {
+		// remove `.html` from the link, assuming GitHub-like static hosting, which
+		// when serving a file `a`, falls back to `a.html`.
+		link = strings.TrimSuffix(link, ".html")
+	}
 
 	// if page URL is explicitly set in frontmatter,
 	// preserve its value without sanitization

@@ -279,7 +279,444 @@ func (s *Site) isEnabled(kind string) bool {
 	if kind == kindUnknown {
 		panic("Unknown kind")
 	}
-	return s.conf.IsKindEnabled(kind)
+	return !s.disabledKinds[kind]
+}
+
+// reset returns a new Site prepared for rebuild.
+func (s *Site) reset() *Site {
+	return &Site{
+		Deps:                s.Deps,
+		disabledKinds:       s.disabledKinds,
+		titleFunc:           s.titleFunc,
+		relatedDocsHandler:  s.relatedDocsHandler.Clone(),
+		siteRefLinker:       s.siteRefLinker,
+		outputFormats:       s.outputFormats,
+		rc:                  s.rc,
+		outputFormatsConfig: s.outputFormatsConfig,
+		frontmatterHandler:  s.frontmatterHandler,
+		mediaTypesConfig:    s.mediaTypesConfig,
+		language:            s.language,
+		siteBucket:          s.siteBucket,
+		h:                   s.h,
+		publisher:           s.publisher,
+		siteConfigConfig:    s.siteConfigConfig,
+		init:                s.init,
+		PageCollections:     s.PageCollections,
+		siteCfg:             s.siteCfg,
+	}
+}
+
+// newSite creates a new site with the given configuration.
+func newSite(cfg deps.DepsCfg) (*Site, error) {
+	if cfg.Language == nil {
+		cfg.Language = langs.NewDefaultLanguage(cfg.Cfg)
+	}
+	if cfg.Logger == nil {
+		panic("logger must be set")
+	}
+
+	ignoreErrors := cast.ToStringSlice(cfg.Language.Get("ignoreErrors"))
+	ignorableLogger := loggers.NewIgnorableLogger(cfg.Logger, ignoreErrors...)
+
+	disabledKinds := make(map[string]bool)
+	for _, disabled := range cast.ToStringSlice(cfg.Language.Get("disableKinds")) {
+		disabledKinds[disabled] = true
+	}
+
+	if disabledKinds["taxonomyTerm"] {
+		// Correct from the value it had before Hugo 0.73.0.
+		if disabledKinds[page.KindTaxonomy] {
+			disabledKinds[page.KindTerm] = true
+		} else {
+			disabledKinds[page.KindTaxonomy] = true
+		}
+
+		delete(disabledKinds, "taxonomyTerm")
+	} else if disabledKinds[page.KindTaxonomy] && !disabledKinds[page.KindTerm] {
+		// This is a potentially ambiguous situation. It may be correct.
+		ignorableLogger.Errorsf(constants.ErrIDAmbigousDisableKindTaxonomy, `You have the value 'taxonomy' in the disabledKinds list. In Hugo 0.73.0 we fixed these to be what most people expect (taxonomy and term).
+But this also means that your site configuration may not do what you expect. If it is correct, you can suppress this message by following the instructions below.`)
+	}
+
+	var (
+		mediaTypesConfig    []map[string]any
+		outputFormatsConfig []map[string]any
+
+		siteOutputFormatsConfig output.Formats
+		siteMediaTypesConfig    media.Types
+		err                     error
+	)
+
+	// Add language last, if set, so it gets precedence.
+	for _, cfg := range []config.Provider{cfg.Cfg, cfg.Language} {
+		if cfg.IsSet("mediaTypes") {
+			mediaTypesConfig = append(mediaTypesConfig, cfg.GetStringMap("mediaTypes"))
+		}
+		if cfg.IsSet("outputFormats") {
+			outputFormatsConfig = append(outputFormatsConfig, cfg.GetStringMap("outputFormats"))
+		}
+	}
+
+	siteMediaTypesConfig, err = media.DecodeTypes(mediaTypesConfig...)
+	if err != nil {
+		return nil, err
+	}
+
+	siteOutputFormatsConfig, err = output.DecodeFormats(siteMediaTypesConfig, outputFormatsConfig...)
+	if err != nil {
+		return nil, err
+	}
+
+	rssDisabled := disabledKinds[kindRSS]
+	if rssDisabled {
+		// Legacy
+		tmp := siteOutputFormatsConfig[:0]
+		for _, x := range siteOutputFormatsConfig {
+			if !strings.EqualFold(x.Name, "rss") {
+				tmp = append(tmp, x)
+			}
+		}
+		siteOutputFormatsConfig = tmp
+	}
+
+	var siteOutputs map[string]any
+	if cfg.Language.IsSet("outputs") {
+		siteOutputs = cfg.Language.GetStringMap("outputs")
+
+		// Check and correct taxonomy kinds vs pre Hugo 0.73.0.
+		v1, hasTaxonomyTerm := siteOutputs["taxonomyterm"]
+		v2, hasTaxonomy := siteOutputs[page.KindTaxonomy]
+		_, hasTerm := siteOutputs[page.KindTerm]
+		if hasTaxonomy && hasTaxonomyTerm {
+			siteOutputs[page.KindTaxonomy] = v1
+			siteOutputs[page.KindTerm] = v2
+			delete(siteOutputs, "taxonomyTerm")
+		} else if hasTaxonomy && !hasTerm {
+			// This is a potentially ambiguous situation. It may be correct.
+			ignorableLogger.Errorsf(constants.ErrIDAmbigousOutputKindTaxonomy, `You have configured output formats for 'taxonomy' in your site configuration. In Hugo 0.73.0 we fixed these to be what most people expect (taxonomy and term).
+But this also means that your site configuration may not do what you expect. If it is correct, you can suppress this message by following the instructions below.`)
+		}
+		if !hasTaxonomy && hasTaxonomyTerm {
+			siteOutputs[page.KindTaxonomy] = v1
+			delete(siteOutputs, "taxonomyterm")
+		}
+	}
+
+	outputFormats, err := createSiteOutputFormats(siteOutputFormatsConfig, siteOutputs, rssDisabled)
+	if err != nil {
+		return nil, err
+	}
+
+	taxonomies := cfg.Language.GetStringMapString("taxonomies")
+
+	var relatedContentConfig related.Config
+
+	if cfg.Language.IsSet("related") {
+		relatedContentConfig, err = related.DecodeConfig(cfg.Language.GetParams("related"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode related config: %w", err)
+		}
+	} else {
+		relatedContentConfig = related.DefaultConfig
+		if _, found := taxonomies["tag"]; found {
+			relatedContentConfig.Add(related.IndexConfig{Name: "tags", Weight: 80})
+		}
+	}
+
+	titleFunc := helpers.GetTitleFunc(cfg.Language.GetString("titleCaseStyle"))
+
+	frontMatterHandler, err := pagemeta.NewFrontmatterHandler(cfg.Logger, cfg.Cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	timeout := 30 * time.Second
+	if cfg.Language.IsSet("timeout") {
+		v := cfg.Language.Get("timeout")
+		d, err := types.ToDurationE(v)
+		if err == nil {
+			timeout = d
+		}
+	}
+
+	siteConfig := siteConfigHolder{
+		sitemap:          config.DecodeSitemap(config.Sitemap{Priority: -1, Filename: "sitemap.xml"}, cfg.Language.GetStringMap("sitemap")),
+		taxonomiesConfig: taxonomies,
+		timeout:          timeout,
+		hasCJKLanguage:   cfg.Language.GetBool("hasCJKLanguage"),
+		enableEmoji:      cfg.Language.Cfg.GetBool("enableEmoji"),
+	}
+
+	var siteBucket *pagesMapBucket
+	if cfg.Language.IsSet("cascade") {
+		var err error
+		cascade, err := page.DecodeCascade(cfg.Language.Get("cascade"))
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode cascade config: %s", err)
+		}
+
+		siteBucket = &pagesMapBucket{
+			cascade: cascade,
+		}
+
+	}
+
+	s := &Site{
+		language:      cfg.Language,
+		siteBucket:    siteBucket,
+		disabledKinds: disabledKinds,
+
+		outputFormats:       outputFormats,
+		outputFormatsConfig: siteOutputFormatsConfig,
+		mediaTypesConfig:    siteMediaTypesConfig,
+
+		siteCfg: siteConfig,
+
+		titleFunc: titleFunc,
+
+		rc: &siteRenderingContext{output.HTMLFormat},
+
+		frontmatterHandler: frontMatterHandler,
+		relatedDocsHandler: page.NewRelatedDocsHandler(relatedContentConfig),
+	}
+
+	s.prepareInits()
+
+	return s, nil
+}
+
+// NewSite creates a new site with the given dependency configuration.
+// The site will have a template system loaded and ready to use.
+// Note: This is mainly used in single site tests.
+func NewSite(cfg deps.DepsCfg) (*Site, error) {
+	s, err := newSite(cfg)
+	if err != nil {
+		return nil, err
+	}
+
+	var l configLoader
+	if err = l.applyDeps(cfg, s); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+// NewSiteDefaultLang creates a new site in the default language.
+// The site will have a template system loaded and ready to use.
+// Note: This is mainly used in single site tests.
+// TODO(bep) test refactor -- remove
+func NewSiteDefaultLang(withTemplate ...func(templ tpl.TemplateManager) error) (*Site, error) {
+	l := configLoader{cfg: config.New()}
+	if err := l.applyConfigDefaults(); err != nil {
+		return nil, err
+	}
+	return newSiteForLang(langs.NewDefaultLanguage(l.cfg), withTemplate...)
+}
+
+// NewEnglishSite creates a new site in English language.
+// The site will have a template system loaded and ready to use.
+// Note: This is mainly used in single site tests.
+// TODO(bep) test refactor -- remove
+func NewEnglishSite(withTemplate ...func(templ tpl.TemplateManager) error) (*Site, error) {
+	l := configLoader{cfg: config.New()}
+	if err := l.applyConfigDefaults(); err != nil {
+		return nil, err
+	}
+	return newSiteForLang(langs.NewLanguage("en", l.cfg), withTemplate...)
+}
+
+// newSiteForLang creates a new site in the given language.
+func newSiteForLang(lang *langs.Language, withTemplate ...func(templ tpl.TemplateManager) error) (*Site, error) {
+	withTemplates := func(templ tpl.TemplateManager) error {
+		for _, wt := range withTemplate {
+			if err := wt(templ); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	cfg := deps.DepsCfg{WithTemplate: withTemplates, Cfg: lang}
+
+	return NewSiteForCfg(cfg)
+}
+
+// NewSiteForCfg creates a new site for the given configuration.
+// The site will have a template system loaded and ready to use.
+// Note: This is mainly used in single site tests.
+func NewSiteForCfg(cfg deps.DepsCfg) (*Site, error) {
+	h, err := NewHugoSites(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return h.Sites[0], nil
+}
+
+type SiteInfo struct {
+	Authors page.AuthorList
+	Social  SiteSocial
+
+	hugoInfo     hugo.Info
+	title        string
+	RSSLink      string
+	Author       map[string]any
+	LanguageCode string
+	Copyright    string
+
+	permalinks map[string]string
+
+	LanguagePrefix string
+	Languages      langs.Languages
+
+	BuildDrafts bool
+
+	canonifyURLs bool
+	relativeURLs bool
+	uglyURLs     func(p page.Page) bool
+	RemoveHTMLExtension bool
+
+	owner                          *HugoSites
+	s                              *Site
+	language                       *langs.Language
+	defaultContentLanguageInSubdir bool
+	sectionPagesMenu               string
+}
+
+func (s *SiteInfo) Pages() page.Pages {
+	return s.s.Pages()
+}
+
+func (s *SiteInfo) RegularPages() page.Pages {
+	return s.s.RegularPages()
+}
+
+func (s *SiteInfo) AllPages() page.Pages {
+	return s.s.AllPages()
+}
+
+func (s *SiteInfo) AllRegularPages() page.Pages {
+	return s.s.AllRegularPages()
+}
+
+func (s *SiteInfo) LastChange() time.Time {
+	return s.s.lastmod
+}
+
+func (s *SiteInfo) Title() string {
+	return s.title
+}
+
+func (s *SiteInfo) Site() page.Site {
+	return s
+}
+
+func (s *SiteInfo) Menus() navigation.Menus {
+	return s.s.Menus()
+}
+
+// TODO(bep) type
+func (s *SiteInfo) Taxonomies() page.TaxonomyList {
+	return s.s.Taxonomies()
+}
+
+func (s *SiteInfo) Params() maps.Params {
+	return s.s.Language().Params()
+}
+
+func (s *SiteInfo) Data() map[string]any {
+	return s.s.h.Data()
+}
+
+func (s *SiteInfo) Language() *langs.Language {
+	return s.language
+}
+
+func (s *SiteInfo) Config() SiteConfig {
+	return s.s.siteConfigConfig
+}
+
+func (s *SiteInfo) Hugo() hugo.Info {
+	return s.hugoInfo
+}
+
+// Sites is a convenience method to get all the Hugo sites/languages configured.
+func (s *SiteInfo) Sites() page.Sites {
+	return s.s.h.siteInfos()
+}
+
+// Current returns the currently rendered Site.
+// If that isn't set yet, which is the situation before we start rendering,
+// if will return the Site itself.
+func (s *SiteInfo) Current() page.Site {
+	if s.s.h.currentSite == nil {
+		return s
+	}
+	return s.s.h.currentSite.Info
+}
+
+func (s *SiteInfo) String() string {
+	return fmt.Sprintf("Site(%q)", s.title)
+}
+
+func (s *SiteInfo) BaseURL() template.URL {
+	return template.URL(s.s.PathSpec.BaseURL.String())
+}
+
+// ServerPort returns the port part of the BaseURL, 0 if none found.
+func (s *SiteInfo) ServerPort() int {
+	ps := s.s.PathSpec.BaseURL.URL().Port()
+	if ps == "" {
+		return 0
+	}
+	p, err := strconv.Atoi(ps)
+	if err != nil {
+		return 0
+	}
+	return p
+}
+
+// GoogleAnalytics is kept here for historic reasons.
+func (s *SiteInfo) GoogleAnalytics() string {
+	return s.Config().Services.GoogleAnalytics.ID
+}
+
+// DisqusShortname is kept here for historic reasons.
+func (s *SiteInfo) DisqusShortname() string {
+	return s.Config().Services.Disqus.Shortname
+}
+
+func (s *SiteInfo) GetIdentity() identity.Identity {
+	return identity.KeyValueIdentity{Key: "site", Value: s.language.Lang}
+}
+
+// SiteSocial is a place to put social details on a site level. These are the
+// standard keys that themes will expect to have available, but can be
+// expanded to any others on a per site basis
+// github
+// facebook
+// facebook_admin
+// twitter
+// twitter_domain
+// pinterest
+// instagram
+// youtube
+// linkedin
+type SiteSocial map[string]string
+
+// Param is a convenience method to do lookups in SiteInfo's Params map.
+//
+// This method is also implemented on Page.
+func (s *SiteInfo) Param(key any) (any, error) {
+	return resource.Param(s, nil, key)
+}
+
+func (s *SiteInfo) IsMultiLingual() bool {
+	return len(s.Languages) > 1
+}
+
+func (s *SiteInfo) IsServer() bool {
+	return s.owner.running
 }
 
 type siteRefLinker struct {
@@ -727,6 +1164,108 @@ func (s *Site) SitemapAbsURL() string {
 	}
 	p += s.conf.Sitemap.Filename
 	return p
+}
+
+func (s *Site) initializeSiteInfo() error {
+	var (
+		lang      = s.language
+		languages langs.Languages
+	)
+
+	if s.h != nil && s.h.multilingual != nil {
+		languages = s.h.multilingual.Languages
+	}
+
+	permalinks := s.Cfg.GetStringMapString("permalinks")
+
+	defaultContentInSubDir := s.Cfg.GetBool("defaultContentLanguageInSubdir")
+	defaultContentLanguage := s.Cfg.GetString("defaultContentLanguage")
+
+	languagePrefix := ""
+	if s.multilingualEnabled() && (defaultContentInSubDir || lang.Lang != defaultContentLanguage) {
+		languagePrefix = "/" + lang.Lang
+	}
+
+	uglyURLs := func(p page.Page) bool {
+		return false
+	}
+
+	v := s.Cfg.Get("uglyURLs")
+	if v != nil {
+		switch vv := v.(type) {
+		case bool:
+			uglyURLs = func(p page.Page) bool {
+				return vv
+			}
+		case string:
+			// Is what be get from CLI (--uglyURLs)
+			vvv := cast.ToBool(vv)
+			uglyURLs = func(p page.Page) bool {
+				return vvv
+			}
+		default:
+			m := maps.ToStringMapBool(v)
+			uglyURLs = func(p page.Page) bool {
+				return m[p.Section()]
+			}
+		}
+	}
+
+	// Assemble dependencies to be used in hugo.Deps.
+	// TODO(bep) another reminder: We need to clean up this Site vs HugoSites construct.
+	var deps []*hugo.Dependency
+	var depFromMod func(m modules.Module) *hugo.Dependency
+	depFromMod = func(m modules.Module) *hugo.Dependency {
+		dep := &hugo.Dependency{
+			Path:    m.Path(),
+			Version: m.Version(),
+			Time:    m.Time(),
+			Vendor:  m.Vendor(),
+		}
+
+		// These are pointers, but this all came from JSON so there's no recursive navigation,
+		// so just create new values.
+		if m.Replace() != nil {
+			dep.Replace = depFromMod(m.Replace())
+		}
+		if m.Owner() != nil {
+			dep.Owner = depFromMod(m.Owner())
+		}
+		return dep
+	}
+	for _, m := range s.Paths.AllModules {
+		deps = append(deps, depFromMod(m))
+	}
+
+	s.Info = &SiteInfo{
+		title:                          lang.GetString("title"),
+		Author:                         lang.GetStringMap("author"),
+		Social:                         lang.GetStringMapString("social"),
+		LanguageCode:                   lang.GetString("languageCode"),
+		Copyright:                      lang.GetString("copyright"),
+		language:                       lang,
+		LanguagePrefix:                 languagePrefix,
+		Languages:                      languages,
+		defaultContentLanguageInSubdir: defaultContentInSubDir,
+		sectionPagesMenu:               lang.GetString("sectionPagesMenu"),
+		BuildDrafts:                    s.Cfg.GetBool("buildDrafts"),
+		canonifyURLs:                   s.Cfg.GetBool("canonifyURLs"),
+		relativeURLs:                   s.Cfg.GetBool("relativeURLs"),
+		uglyURLs:                       uglyURLs,
+		RemoveHTMLExtension:            s.Cfg.GetBool("removeHTMLExtension"),
+		permalinks:                     permalinks,
+		owner:                          s.h,
+		s:                              s,
+		hugoInfo:                       hugo.NewInfo(s.Cfg.GetString("environment"), deps),
+	}
+
+	rssOutputFormat, found := s.outputFormats[page.KindHome].GetByName(output.RSSFormat.Name)
+
+	if found {
+		s.Info.RSSLink = s.permalink(rssOutputFormat.BaseFilename())
+	}
+
+	return nil
 }
 
 func (s *Site) eventToIdentity(e fsnotify.Event) (identity.PathIdentity, bool) {

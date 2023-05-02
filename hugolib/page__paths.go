@@ -132,6 +132,8 @@ func createTargetPathDescriptor(s *Site, p page.Page, pm *pageMeta) (page.Target
 		ForcePrefix: s.h.Conf.IsMultihost() || alwaysInSubDir,
 		Dir:         dir,
 		URL:         pm.urlPaths.URL,
+
+		RemoveHTMLExtension: s.Info.RemoveHTMLExtension,
 	}
 
 	if pm.Slug() != "" {

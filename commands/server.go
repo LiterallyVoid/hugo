@@ -276,7 +276,36 @@ func (f *fileServer) createEndpoint(i int) (*http.ServeMux, net.Listener, string
 				w.Header().Set(header.Key, header.Value)
 			}
 
-			if redirect := serverConfig.MatchRedirect(requestURI); !redirect.IsZero() {
+			if true {
+				jww.FEEDBACK.Println("checking for .html extension")
+
+				path := filepath.Clean(strings.TrimPrefix(requestURI, u.Path))
+				if root != "" {
+					path = filepath.Join(root, path)
+				}
+
+				fs := f.c.publishDirServerFs
+				fi, err := fs.Stat(path)
+
+				jww.FEEDBACK.Println("path", path)
+
+				if err != nil || fi.IsDir() {
+					jww.FEEDBACK.Println("ERROR!")
+					if !strings.HasSuffix(path, "/") && filepath.Ext(path) == "" {
+						jww.FEEDBACK.Println("rewriting", path, "to", path + ".html")
+						jww.FEEDBACK.Println("old path:", r.RequestURI)
+						if r2 := f.rewriteRequest(r, r.RequestURI + ".html"); r2 != nil {
+							r = r2
+
+							requestURI = r.RequestURI + ".html"
+						}
+
+						jww.FEEDBACK.Println("new path:", r.RequestURI)
+					}
+				}
+			}
+
+			if redirect := f.c.serverConfig.MatchRedirect(requestURI); !redirect.IsZero() {
 				// fullName := filepath.Join(dir, filepath.FromSlash(path.Clean("/"+name)))
 				doRedirect := true
 				// This matches Netlify's behaviour and is needed for SPA behaviour.
